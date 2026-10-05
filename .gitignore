@@ -1,0 +1,9 @@
+# Attach the release archive to a GitHub release. It is not source.
+*.tar.gz
+SHA256SUMS
+
+# Windows driver signature. Not part of the color configuration.
+MONITOR_ICC/TPLCD.CAT
+
+__pycache__/
+*.py[cod]

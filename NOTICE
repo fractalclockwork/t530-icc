@@ -1,0 +1,27 @@
+Lenovo ThinkPad Monitor INF/Color Profile
+Driver version 5.03.0.0, 14 August 2013
+
+The files in MONITOR_ICC/ are unmodified copies of Lenovo's ThinkPad LCD
+monitor profiles and the INF table that selects them:
+
+  TPLCD.INF
+  TPLCD.icm
+  TPLCD60.icm
+  TPLCD95.icm
+  TPLCD100.icm
+  TPFLX.icm
+  TPFLX60.icm
+  TPMB60.icm
+  TPMB72.icm
+  TPMB72_1.icm
+
+Each profile carries Lenovo's own copyright notice from 2005. TPLCD.INF
+carries Lenovo's copyright as well. They are kept here, byte for byte,
+because Lenovo no longer supports the ThinkPad T530 and these files are the
+calibration and the match list for its panels.
+
+This package does not include TPLCD.CAT. That file is the Windows driver
+signature and is not part of the color configuration.
+
+t530-icc, README.md, and LICENSE are not Lenovo's files. Their terms are in
+LICENSE. Lenovo does not supply or support this package.

@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""Query a ThinkPad T530 panel and install the Lenovo ICM TPLCD.INF names.
+
+Windows selects the profile from MONITOR_ICC/TPLCD.INF. Stock T530 panels are
+not in that table under their AUO/LGD/SEC id, so this matches a 15.6 inch row
+only when the preferred resolution and the EDID gamut class (60, 72, 95, or
+100) pick exactly one profile. Anything else aborts. There is no nearest-gamut
+fallback: TPLCD100.icm sits nearer the FHD EDID than TPLCD95.icm, and the INF
+still assigns TPLCD95.icm only to the gamut-95 row.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+ROOT = Path(__file__).resolve().parent
+ICC_DIR = ROOT / "MONITOR_ICC"
+INF_PATH = ICC_DIR / "TPLCD.INF"
+
+# AddReg token -> (gamut percent or None, flexview, maxbright).
+# Longer tokens are their own keys; lookup is exact.
+ICM_KEYS: dict[str, tuple[int | None, bool, bool]] = {
+    "ICMG60": (60, False, False),
+    "ICMFG60": (60, True, False),
+    "ICMMB60": (60, False, True),
+    "ICMMB72": (72, False, True),
+    "ICMMB72_1": (72, False, True),
+    "ICMG95": (95, False, False),
+    "ICMG100": (100, False, False),
+    "ICMF": (None, True, False),
+    "ICM": (None, False, False),
+}
+
+NTSC_R = (0.67, 0.33)
+NTSC_G = (0.21, 0.71)
+NTSC_B = (0.14, 0.08)
+
+ROW_RE = re.compile(
+    r"^%\w+%\s*=\s*(?P<section>[\w.]+)\s*,\s*Monitor\\(?P<hwid>[0-9A-Za-z]+)"
+    r"\s*(?:;\s*(?P<comment>.*))?$"
+)
+SECTION_RE = re.compile(r"^\[(?P<name>[^\]]+)\]")
+
+
+@dataclass(frozen=True)
+class Panel:
+    connector: str
+    pnp_id: str
+    vendor: str
+    product_code: int
+    names: tuple[str, ...]
+    width: int
+    height: int
+    ntsc: float
+    gamma: float
+
+
+@dataclass(frozen=True)
+class InfRow:
+    hardware_id: str
+    section: str
+    resolution: tuple[int, int]
+    profile: str
+    gamut: int | None
+    comment: str
+    flexview: bool
+    maxbright: bool
+
+
+@dataclass(frozen=True)
+class Machine:
+    hostname: str
+    product: str
+    version: str
+    panels: tuple[Panel, ...]
+    family: str = ""
+
+
+def machine_identity(machine: Machine) -> str:
+    """DMI strings that name the machine. Lenovo puts ThinkPad T530 in version and family, not product_name."""
+    parts: list[str] = []
+    for part in (machine.product, machine.version, machine.family):
+        if part and part not in parts:
+            parts.append(part)
+    return " ".join(parts)
+
+
+def gamut_class(ntsc: float) -> int:
+    """Map a measured NTSC percentage onto Lenovo's profile labels."""
+    if ntsc >= 97.5:
+        return 100
+    if ntsc >= 83.5:
+        return 95
+    if ntsc >= 66.0:
+        return 72
+    return 60
+
+
+def _triangle_area(r: tuple[float, float], g: tuple[float, float], b: tuple[float, float]) -> float:
+    (x1, y1), (x2, y2), (x3, y3) = r, g, b
+    return abs(x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2
+
+
+def ntsc_percent(r: tuple[float, float], g: tuple[float, float], b: tuple[float, float]) -> float:
+    return 100.0 * _triangle_area(r, g, b) / _triangle_area(NTSC_R, NTSC_G, NTSC_B)
+
+
+def _chroma_coord(msb: int, low: int) -> float:
+    return ((msb << 2) | low) / 1024.0
+
+
+def decode_edid(edid: bytes, connector: str) -> Panel:
+    if len(edid) < 128 or edid[0:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        raise ValueError(f"{connector}: EDID is missing or truncated ({len(edid)} bytes)")
+    raw = (edid[8] << 8) | edid[9]
+    vendor = "".join(chr(((raw >> shift) & 0x1F) + 64) for shift in (10, 5, 0))
+    product = edid[10] | (edid[11] << 8)
+    width = height = 0
+    names: list[str] = []
+    for index in range(4):
+        block = edid[54 + index * 18 : 54 + (index + 1) * 18]
+        clock = int.from_bytes(block[0:2], "little")
+        if clock:
+            if width == 0:
+                width = block[2] | ((block[4] & 0xF0) << 4)
+                height = block[5] | ((block[7] & 0xF0) << 4)
+            continue
+        if block[3] in (0xFC, 0xFE, 0xFF):
+            text = block[5:18].split(b"\n", 1)[0].decode("ascii", "replace").strip()
+            if text:
+                names.append(text)
+    if width == 0 or height == 0:
+        raise ValueError(f"{connector}: EDID has no detailed timing")
+    lo_rg, lo_bw = edid[0x19], edid[0x1A]
+    red = (_chroma_coord(edid[0x1B], (lo_rg >> 6) & 3), _chroma_coord(edid[0x1C], (lo_rg >> 4) & 3))
+    green = (_chroma_coord(edid[0x1D], (lo_rg >> 2) & 3), _chroma_coord(edid[0x1E], lo_rg & 3))
+    blue = (_chroma_coord(edid[0x1F], (lo_bw >> 6) & 3), _chroma_coord(edid[0x20], (lo_bw >> 4) & 3))
+    gamma = (edid[0x17] + 100) / 100.0 if edid[0x17] != 0xFF else 0.0
+    return Panel(
+        connector=connector,
+        pnp_id=f"{vendor}{product:04X}",
+        vendor=vendor,
+        product_code=product,
+        names=tuple(names),
+        width=width,
+        height=height,
+        ntsc=ntsc_percent(red, green, blue),
+        gamma=gamma,
+    )
+
+
+def parse_inf(text: str) -> tuple[InfRow, ...]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        header = SECTION_RE.match(stripped)
+        if header:
+            current = header.group("name")
+            sections.setdefault(current, [])
+            continue
+        if current is not None and stripped and not stripped.startswith(";"):
+            sections[current].append(stripped)
+
+    resolutions: dict[str, tuple[int, int]] = {}
+    profiles: dict[str, str] = {}
+    for name, lines in sections.items():
+        for line in lines:
+            if "MaxResolution" in line:
+                match = re.search(r'"(\d+)\s*,\s*(\d+)"', line)
+                if match:
+                    resolutions[name] = (int(match.group(1)), int(match.group(2)))
+            if "ICMProfile" in line:
+                match = re.search(r'"([^"]+)"', line)
+                if match:
+                    profiles[name] = match.group(1)
+
+    installs: dict[str, tuple[tuple[int, int], str, int | None, bool, bool]] = {}
+    for name, lines in sections.items():
+        if not name.endswith(".Install") or name.endswith(".NTx86"):
+            continue
+        addreg = next((line for line in lines if line.startswith("AddReg=")), "")
+        tokens = [token.strip() for token in addreg.split("=", 1)[-1].split(",")]
+        resolution = next((resolutions[token] for token in tokens if token in resolutions), None)
+        icm_token = next((token for token in tokens if token in ICM_KEYS), None)
+        if resolution is None or icm_token is None or icm_token not in profiles:
+            continue
+        gamut, flexview, maxbright = ICM_KEYS[icm_token]
+        installs[name] = (resolution, profiles[icm_token], gamut, flexview, maxbright)
+
+    rows: list[InfRow] = []
+    for line in sections.get("Lenovo", []):
+        match = ROW_RE.match(line)
+        if not match:
+            continue
+        section = match.group("section")
+        if section not in installs:
+            continue
+        resolution, profile, gamut, flexview, maxbright = installs[section]
+        comment = (match.group("comment") or "").strip()
+        low = comment.lower()
+        rows.append(
+            InfRow(
+                hardware_id=match.group("hwid").upper(),
+                section=section,
+                resolution=resolution,
+                profile=profile,
+                gamut=gamut,
+                comment=comment,
+                flexview=flexview or "ips" in low or "flexview" in low,
+                maxbright=maxbright or "maxbright" in low or "high bright" in low,
+            )
+        )
+    if not rows:
+        raise ValueError(f"no monitor rows parsed from {INF_PATH}")
+    return tuple(rows)
+
+
+def resolve_profile(name: str) -> Path:
+    for path in ICC_DIR.iterdir():
+        if path.is_file() and path.name.lower() == name.lower():
+            return path
+    raise FileNotFoundError(f"{name} is named by the INF but is not in {ICC_DIR}")
+
+
+def _row_list(rows: list[InfRow]) -> str:
+    return ", ".join(
+        f"{row.hardware_id} -> {row.profile} (gamut {row.gamut if row.gamut is not None else 'unspecified'})"
+        for row in sorted(rows, key=lambda row: row.hardware_id)
+    )
+
+
+def select_row(panel: Panel, rows: tuple[InfRow, ...]) -> tuple[InfRow, str]:
+    """Return the one INF row for this panel.
+
+    A hardware id in the EDID is exact. Otherwise the panel must hit one
+    15.6 inch row whose resolution and gamut class agree, and every such row
+    must name the same ICM file. Nearest-gamut and generic-profile choices abort.
+    """
+    by_id = {row.hardware_id: row for row in rows}
+    if panel.pnp_id.upper() in by_id:
+        return by_id[panel.pnp_id.upper()], "EDID hardware id"
+
+    same_res = [row for row in rows if row.resolution == (panel.width, panel.height)]
+    pool = [row for row in same_res if re.search(r'15\.6\s*"', row.comment)]
+    klass = gamut_class(panel.ntsc)
+    how = f"{panel.width}x{panel.height}, gamut {klass} ({panel.ntsc:.1f}% NTSC)"
+    if not pool:
+        raise LookupError(f"no clear match for {how}: no 15.6 inch TPLCD.INF row at this resolution")
+
+    matched = [row for row in pool if row.gamut == klass]
+    if not matched:
+        raise LookupError(f"no clear match for {how}. 15.6 inch rows: {_row_list(pool)}")
+
+    profiles = {row.profile.lower() for row in matched}
+    if len(profiles) != 1:
+        raise LookupError(f"no clear match for {how}: {_row_list(matched)}")
+
+    labeled = [
+        row
+        for row in matched
+        if f"gamut{klass}" in row.comment.lower().replace(" ", "")
+    ]
+    # Several hardware ids may share one ICM file. Citing the row whose
+    # comment names this gamut class does not change which file is installed.
+    chosen = sorted(labeled or matched, key=lambda row: row.hardware_id)[0]
+    return chosen, how
+
+
+def _is_internal(connector: str) -> bool:
+    name = connector.upper()
+    return "LVDS" in name or "EDP" in name
+
+
+def parse_probe(text: str) -> Machine:
+    hostname = product = version = family = ""
+    panels: list[Panel] = []
+    pending: str | None = None
+    for line in text.splitlines():
+        if line.startswith("HOSTNAME "):
+            hostname = line.split(" ", 1)[1].strip()
+        elif line.startswith("PRODUCT "):
+            product = line.split(" ", 1)[1].strip()
+        elif line.startswith("VERSION "):
+            version = line.split(" ", 1)[1].strip()
+        elif line.startswith("FAMILY "):
+            family = line.split(" ", 1)[1].strip()
+        elif line.startswith("CONNECTOR "):
+            pending = line.split(" ", 1)[1].strip()
+        elif line.startswith("EDID ") and pending:
+            raw = base64.b64decode(line.split(" ", 1)[1].strip())
+            panels.append(decode_edid(raw, pending))
+            pending = None
+    return Machine(
+        hostname=hostname, product=product, version=version, family=family, panels=tuple(panels)
+    )
+
+
+PROBE = r"""
+set -eu
+printf 'HOSTNAME %s\n' "$(hostname)"
+printf 'PRODUCT %s\n' "$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+printf 'VERSION %s\n' "$(cat /sys/class/dmi/id/product_version 2>/dev/null || true)"
+printf 'FAMILY %s\n' "$(cat /sys/class/dmi/id/product_family 2>/dev/null || true)"
+for d in /sys/class/drm/card*-*; do
+  [ -f "$d/status" ] || continue
+  name=$(basename "$d")
+  status=$(cat "$d/status" 2>/dev/null || true)
+  [ "$status" = connected ] || continue
+  # The drm edid attribute reports st_size 0, so [ -s ] skips a panel that can still be read.
+  edid=$(base64 -w0 "$d/edid" 2>/dev/null || true)
+  [ -n "$edid" ] || continue
+  printf 'CONNECTOR %s\n' "$name"
+  printf 'EDID %s\n' "$edid"
+done
+"""
+
+
+def run(cmd: list[str], input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def probe_local() -> Machine:
+    result = run(["bash", "-s"], PROBE)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "local probe failed")
+    return parse_probe(result.stdout)
+
+
+def probe_remote(host: str) -> Machine:
+    result = run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "bash", "-s"],
+        PROBE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"ssh {host} failed")
+    return parse_probe(result.stdout)
+
+
+def target_panels(machine: Machine, connector: str | None) -> list[Panel]:
+    panels = list(machine.panels)
+    if connector:
+        panels = [panel for panel in panels if connector.upper() in panel.connector.upper()]
+        if not panels:
+            raise LookupError(f"no connected panel matching {connector}")
+        return panels
+    internal = [panel for panel in panels if _is_internal(panel.connector)]
+    if not internal:
+        raise LookupError(
+            "no connected internal panel (LVDS or eDP). "
+            "External monitors are not given a ThinkPad LCD profile."
+        )
+    return internal
+
+
+def format_choice(machine: Machine, panel: Panel, row: InfRow, reason: str, path: Path) -> str:
+    names = ", ".join(panel.names) if panel.names else panel.vendor
+    product = machine_identity(machine)
+    return "\n".join(
+        [
+            f"host:       {machine.hostname or '(local)'}",
+            f"product:    {product or '(unknown)'}",
+            f"connector:  {panel.connector}",
+            f"panel:      {names} ({panel.pnp_id})",
+            f"resolution: {panel.width}x{panel.height}",
+            f"gamma:      {panel.gamma:.1f}",
+            f"ntsc:       {panel.ntsc:.1f}%",
+            f"match:      {reason}",
+            f"inf:        {row.hardware_id}  {row.comment}",
+            f"profile:    {path}",
+        ]
+    )
+
+
+def _colormgr(host: str | None, args: list[str]) -> subprocess.CompletedProcess[str]:
+    # An SSH login is a remote session. colord only allows modify-device from the
+    # local user session, which is where gsd-color runs. systemd-run --user lands there.
+    quoted = " ".join(shlex.quote(arg) for arg in ["colormgr", *args])
+    script = (
+        'export XDG_RUNTIME_DIR="/run/user/$(id -u)"\n'
+        f"systemd-run --user --wait --pipe --collect --quiet -- {quoted}\n"
+    )
+    if host is None:
+        return run(["bash", "-s"], script)
+    return run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, "bash", "-s"],
+        script,
+    )
+
+
+def _object_path(text: str) -> str | None:
+    for line in text.splitlines():
+        if line.startswith("Object Path:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _import_profile(host: str | None, remote_file: str, profile: Path) -> str:
+    result = _colormgr(host, ["import-profile", remote_file])
+    path = _object_path(result.stdout)
+    if result.returncode == 0 and path:
+        return path
+    # colord refuses a second import of the same bytes with "not added in time".
+    # The profile id is icc- plus the md5 of the file.
+    digest = hashlib.md5(profile.read_bytes()).hexdigest()
+    found = _colormgr(host, ["find-profile", f"icc-{digest}"])
+    path = _object_path(found.stdout)
+    if found.returncode == 0 and path:
+        return path
+    detail = (result.stderr or result.stdout or found.stderr or found.stdout).strip()
+    raise RuntimeError(f"colormgr import-profile failed: {detail}")
+
+
+def _device_path(host: str | None, connector: str) -> str:
+    xrandr_name = connector.split("-", 1)[-1]
+    result = _colormgr(host, ["find-device-by-property", "XRANDR_name", xrandr_name])
+    path = _object_path(result.stdout)
+    if result.returncode != 0 or not path:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"colord has no display for {xrandr_name}. "
+            f"Run this as the graphical user. {detail}"
+        )
+    return path
+
+
+def install_profile(host: str | None, panel: Panel, profile: Path) -> str:
+    remote_file = str(profile)
+    if host is not None:
+        remote_file = f"/tmp/{profile.name}"
+        copied = run(
+            [
+                "scp",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                str(profile),
+                f"{host}:{remote_file}",
+            ]
+        )
+        if copied.returncode != 0:
+            raise RuntimeError(copied.stderr.strip() or f"scp to {host} failed")
+    profile_path = _import_profile(host, remote_file, profile)
+    device_path = _device_path(host, panel.connector)
+    added = _colormgr(host, ["device-add-profile", device_path, profile_path])
+    if added.returncode != 0 and "already" not in (added.stderr + added.stdout).lower():
+        raise RuntimeError((added.stderr or added.stdout).strip() or "device-add-profile failed")
+    defaulted = _colormgr(host, ["device-make-profile-default", device_path, profile_path])
+    if defaulted.returncode != 0:
+        raise RuntimeError(
+            (defaulted.stderr or defaulted.stdout).strip() or "device-make-profile-default failed"
+        )
+    check = _colormgr(host, ["device-get-default-profile", device_path])
+    if check.returncode != 0:
+        raise RuntimeError((check.stderr or check.stdout).strip() or "could not read the default profile")
+    filename = ""
+    for line in check.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("/") or "Filename:" in line:
+            filename = stripped.split(":", 1)[-1].strip()
+    if profile.name.lower() not in filename.lower() and profile.stem.lower() not in check.stdout.lower():
+        raise RuntimeError(
+            "colord accepted the profile, but it is not the default:\n" + check.stdout.strip()
+        )
+    return filename or profile.name
+
+
+def consider(
+    machine: Machine, panel: Panel, rows: tuple[InfRow, ...], forced: str | None, force: bool
+) -> tuple[InfRow, str, Path]:
+    identity = machine_identity(machine)
+    if "T530" not in identity.upper() and not force:
+        raise RuntimeError(
+            f"{machine.hostname or 'this machine'} reports {identity or 'no product name'}, not a ThinkPad T530. "
+            "Pass --force to install anyway."
+        )
+    if forced:
+        dummy = InfRow(
+            hardware_id="(override)",
+            section="",
+            resolution=(panel.width, panel.height),
+            profile=forced,
+            gamut=None,
+            comment="selected with --profile",
+            flexview=False,
+            maxbright=False,
+        )
+        return dummy, "--profile", resolve_profile(forced)
+    row, reason = select_row(panel, rows)
+    return row, reason, resolve_profile(row.profile)
+
+
+def execute(host: str | None, args: argparse.Namespace, rows: tuple[InfRow, ...]) -> int:
+    machine = probe_local() if host is None else probe_remote(host)
+    panels = target_panels(machine, args.connector)
+    name = machine.hostname or host or "local"
+    choices: list[tuple[Panel, InfRow, str, Path]] = []
+    errors: list[str] = []
+    for panel in panels:
+        try:
+            row, reason, path = consider(machine, panel, rows, args.profile, args.force)
+        except (LookupError, RuntimeError, FileNotFoundError) as exc:
+            errors.append(f"{panel.connector}: {exc}")
+            continue
+        choices.append((panel, row, reason, path))
+    for panel, row, reason, path in choices:
+        print(format_choice(machine, panel, row, reason, path), flush=True)
+        print(flush=True)
+    if errors:
+        for err in errors:
+            print(f"{name}: {err}", file=sys.stderr)
+        print(f"{name}: no profile installed", file=sys.stderr)
+        return 1
+    if args.query:
+        return 0
+    exit_code = 0
+    for panel, _row, _reason, path in choices:
+        try:
+            installed = install_profile(host, panel, path)
+        except RuntimeError as exc:
+            print(f"install failed: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+        print(f"installed:  {installed}")
+        print(f"default on {panel.connector}")
+    return exit_code
+
+
+def self_test() -> int:
+    rows = parse_inf(INF_PATH.read_text(encoding="utf-8", errors="replace"))
+    edid = base64.b64decode(
+        "AP///////wAGr+0RAAAAAAAWAQSQIhN4AiE1rVA3qiQRUFQAAAABAQEBAQEBAQEBAQEBAQEBfDiA1HA4MkA8MKoAWMEQAAAYfDiAfnI4MkA8MKoAWMEQAAAYAAAA/gBBVU8KICAgICAgICAgAAAA/gBCMTU2SFROMDEuMSAKAIE="
+    )
+    panel = decode_edid(edid, "card1-LVDS-1")
+    assert panel.pnp_id == "AUO11ED", panel.pnp_id
+    assert (panel.width, panel.height) == (1920, 1080)
+    assert "B156HTN01.1" in panel.names
+    assert 90.0 < panel.ntsc < 98.0, panel.ntsc
+    row, _reason = select_row(panel, rows)
+    assert row.profile.lower() == "tplcd95.icm", row
+    assert row.hardware_id == "LEN40B2", row
+
+    def fake(width: int, height: int, ntsc: float, pnp: str = "AUO0000") -> Panel:
+        return Panel("card1-LVDS-1", pnp, "AUO", 0, (), width, height, ntsc, 2.2)
+
+    expectations = [
+        (fake(1366, 768, 55.0), "tplcd60.icm", "LEN40B0"),
+        (fake(1600, 900, 62.0), "tplcd60.icm", "LEN40B1"),
+        (fake(1920, 1080, 95.0), "tplcd95.icm", "LEN40B2"),
+        (fake(1920, 1080, 58.0), "tplcd60.icm", "LEN40B4"),
+        (fake(1920, 1080, 95.0, "LEN40B3"), "tplcd.icm", "LEN40B3"),
+    ]
+    for sample, profile, hwid in expectations:
+        chosen, _reason = select_row(sample, rows)
+        assert chosen.profile.lower() == profile, (sample, chosen)
+        assert chosen.hardware_id == hwid, (sample, chosen)
+        resolve_profile(chosen.profile)
+
+    # 75% NTSC is gamut class 72, and no 15.6 inch 1920x1080 row is class 72.
+    # The old nearest-gamut path would have installed TPLCD60.icm or TPLCD95.icm.
+    try:
+        select_row(fake(1920, 1080, 75.0), rows)
+    except LookupError as exc:
+        assert "no clear match" in str(exc), exc
+    else:
+        raise AssertionError("in-between gamut should abort")
+    try:
+        select_row(fake(1280, 800, 60.0), rows)
+    except LookupError as exc:
+        assert "no clear match" in str(exc), exc
+    else:
+        raise AssertionError("resolution with no 15.6 inch row should abort")
+    ambiguous = (
+        InfRow("LENAAAA", "a", (1920, 1080), "TPLCD95.icm", 95, '15.6" one Gamut95', False, False),
+        InfRow("LENBBBB", "b", (1920, 1080), "TPFLX.icm", 95, '15.6" two Gamut95', True, False),
+    )
+    try:
+        select_row(fake(1920, 1080, 95.0), ambiguous)
+    except LookupError as exc:
+        assert "no clear match" in str(exc), exc
+    else:
+        raise AssertionError("two profiles for one gamut class should abort")
+    print(f"self-test ok ({len(rows)} INF rows)")
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Read a T530 panel and install the Lenovo ICM profile TPLCD.INF assigns to it."
+    )
+    parser.add_argument("--version", action="version", version=f"t530-icc {VERSION}")
+    parser.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        help="SSH host to query (repeat for each T530). Default: this machine.",
+    )
+    parser.add_argument("--query", action="store_true", help="Print the selected profile and do not install it.")
+    parser.add_argument("--connector", help="DRM connector to use, for example LVDS-1. Default: the internal panel.")
+    parser.add_argument("--profile", help="Install this ICM filename instead of the INF match.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow a machine whose DMI name is not ThinkPad T530. Profile selection stays exact.",
+    )
+    parser.add_argument("--self-test", action="store_true", help="Check INF parsing against the known T530 panels.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.self_test:
+        return self_test()
+    rows = parse_inf(INF_PATH.read_text(encoding="utf-8", errors="replace"))
+    hosts: list[str | None] = list(args.host) or [None]
+    exit_code = 0
+    for index, host in enumerate(hosts):
+        if index:
+            print()
+        try:
+            exit_code = max(exit_code, execute(host, args, rows))
+        except (RuntimeError, LookupError) as exc:
+            print(f"{host or 'local'}: {exc}", file=sys.stderr)
+            exit_code = 1
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
